@@ -1,0 +1,481 @@
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+local PlayerDS = DataStoreService:GetDataStore("PlayerDS")
+
+local module = {}
+local CustomFuncs = {}
+local SessionData = {}
+
+local SubReq = require(script.Packages.SubReq)
+local PlayerTemplate = require(script.PlayerData)
+
+function createSubReq()
+	local NewReq = SubReq.new()
+	return NewReq
+end
+
+function wrapFunctionWithSubReq(func)
+	return function(...)
+		local subReq = createSubReq()
+		local result = func(...)
+		subReq:resolve(result)
+		return subReq
+	end
+end
+
+local function saveData(Player: Player)
+	local Success = false
+	local success, err
+	local Data = SessionData[Player.UserId]
+
+	print(Data)
+
+	success, err = pcall(function()
+		Data["Session_Locked"] = false
+		PlayerDS:SetAsync(Player.UserId, Data)
+	end)
+
+	if success then
+		print("Success | Saved Player Information")
+		return true
+	else
+		warn("Unable to save data:", err)
+		return false
+	end
+end
+
+function module:WriteCustomFunc(Name: string, Code)
+	local subReq = createSubReq()
+	
+	if type(Name) == "string" and type(Code) == "function" then
+		local isProperlyNamed = string.match(Name, "^[A-Z][a-zA-Z0-9_]*$") ~= nil
+
+		if isProperlyNamed then
+			local isReservedName = string.find(Name, "^(module|require|function|if|else|for|while|return)$") ~= nil
+
+			if not isReservedName then
+				if not CustomFuncs[Name] then
+					CustomFuncs[Name] = Code
+					subReq:resolve()
+					print("Made CustomFunc", Name, Code)
+					return "Success: Custom function created." and subReq
+				else
+					warn("Cannot create function: Function with that name already exists!")
+					warn("Please delete the function and try again!")
+					subReq:reject("Cannot create function: Function with name already exists!")
+					return "Error: Function with that name already exists." and subReq
+				end
+			else
+				warn("Cannot create function: Reserved function name.")
+				subReq:reject("Cannot create function: Reserved function name.")
+				return "Error: Reserved function name. Choose a different name." and subReq
+			end
+		else
+			warn("Cannot create function: Invalid function name format.")
+			subReq:reject("Cannot create function: Invalid function name format.")
+			return "Error: Invalid function name format. Use a proper naming convention." and subReq
+		end
+	else
+		warn("Invalid parameters. Expected string for Name and function for Code.")
+		subReq:reject("Invalid parameters. Expected string for Name and function for Code.")
+		return "Error: Invalid parameters. Expected string for Name and function for Code." and subReq
+	end
+end
+
+function module:CreateLeaderstats(Player: Player, Data: {})
+	local subReq = createSubReq()
+	
+	local leaderstats = Instance.new("Folder")
+	leaderstats.Name = "leaderstats"
+	leaderstats.Parent = Player
+
+	for statName, statValue in pairs(Data) do
+		local stat
+
+		if type(statValue) == "string" then
+			stat = Instance.new("StringValue")
+		elseif type(statValue) == "number" then
+			stat = Instance.new("IntValue")
+		elseif type(statValue) == "boolean" then
+			stat = Instance.new("BoolValue")
+		else
+			warn("Unsupported data type for stat:", statName, type(statValue))
+			return
+		end
+
+		stat.Name = statName
+		stat.Value = statValue == "SessionData" and SessionData[Player.UserId][statName] or statValue
+		stat.Parent = leaderstats
+		
+		SubReq:resolve()
+	end
+	
+	return subReq
+end
+
+function module:ReconcileData(Table, ToClone)
+	local subReq = createSubReq()
+	
+	for key, value in pairs(ToClone) do
+		if Table[key] == nil then
+			Table[key] = ToClone[key]
+		else
+			if type(value) == "table" then
+				for subKey, subValue in pairs(value) do
+					if Table[key][subKey] == nil then
+						Table[key][subKey] = ToClone[key][subKey]
+					end
+				end
+			end
+		end
+		return Table
+	end
+	
+	SubReq:resolve()
+	return subReq
+end
+
+function module:LoadProfile(Player)
+	local subReq = createSubReq()
+
+	if RunService:IsStudio() then
+		print("DBUModule | Roblox Studio - Data will NOT save!")
+	end
+	
+	local ID = game.Players:GetUserIdFromNameAsync(Player)
+
+	local Attempt = 0
+	local Data = nil
+	local Success = false
+
+	repeat
+		local success, err = pcall(function()
+			Data = PlayerDS:GetAsync(ID) or PlayerTemplate
+		end)
+
+		if success then
+			Success = true
+			Data = module:ReconcileData(Data, PlayerTemplate)
+			SessionData[ID] = Data
+			
+			local CurrentCash = module:ReturnData(Player, {"Cash"})
+			local Cash = CurrentCash["Cash"]
+
+			coroutine.wrap(function()
+				local CurrentCash = module:ReturnData(Player, {"Cash"})
+				local Cash = CurrentCash["Cash"]
+				
+				game.ReplicatedStorage.Remotes.UpdateCash:FireClient(Player, Cash)
+			end)
+			
+			print("Success | Loaded and Reconciled Player Information:", SessionData[ID])
+			subReq:resolve()
+		else
+			warn("Failed | Unable to load Player Data", err)
+			subReq:reject(err)
+		end
+
+		Attempt += 1
+	until Success == true or Attempt == 3
+
+	--[[if Attempt == 3 and Success == false then
+		Player:Kick("Unable to load your data! Please try again later!")
+		warn("Player couldn't load their data.")
+	end]]
+
+	if SessionData[ID]["Session_Locked"] == true then
+		Player:Kick("Your session is already locked!")
+		warn("Player kicked due to a locked session.")
+	else
+		if not SessionData[ID]["Session_Locked"] then
+			module:CreateProfileData(ID, {["Session_Locked"] = true})
+		else
+			SessionData[ID]["Session_Locked"] = true
+		end
+	end
+
+	coroutine.wrap(function()
+		while true do
+			if Players[Player.Name] then
+				task.wait(120)
+				module:SaveProfile(Player)
+			else
+				break
+			end
+		end
+	end)
+
+	return subReq
+end
+
+function module:SaveProfile(Player: Player)
+	local subReq = createSubReq()
+	
+	local DidSave = saveData(Player)
+	if DidSave == true then
+		SubReq:resolve()
+	else
+		SubReq:reject("Unable to save!")
+	end
+	
+	return subReq
+end
+
+function module:GetProfileByName(Name: string)
+	local subReq = createSubReq()
+	local ID = game.Players:GetUserIdFromNameAsync(Name)
+
+	SubReq:resolve()
+	return PlayerDS:GetAsync(ID) and subReq
+end
+
+function module:GetProfileByID(ID: number)
+	local subReq = createSubReq()
+	
+	SubReq:resolve()
+	return PlayerDS:GetAsync(ID) and subReq
+end
+
+function module:ReturnData(Player: Player, Key: {})
+	local subReq = createSubReq()
+	local playerData = SessionData[Player.UserId]
+
+	if playerData then
+		if #Key > 0 then
+			local selectedData = {}
+			for _, k in ipairs(Key) do
+				selectedData[k] = playerData[k]
+			end
+			SubReq:resolve()
+			return selectedData
+		else
+			SubReq:resolve()
+			return playerData and subReq
+		end
+	else
+		SubReq:reject("Player is not in the game.")
+		return "Player is not in the game." and subReq
+	end
+end
+
+function module:DoesCusFuncExist(Name: string)
+	local subReq = createSubReq()
+	
+	if CustomFuncs[Name] then
+		SubReq:resolve()
+		return true and subReq
+	else
+		SubReq:resolve()
+		return false and subReq
+	end
+end
+
+function module:UseCusFunc(FuncName: string, Data: {})
+	local subReq = createSubReq()
+	local customFunc = CustomFuncs[FuncName]
+
+	if type(customFunc) == "function" then
+		if type(Data) == "table" then
+			local success, errorOrResult = pcall(customFunc, table.unpack(Data))
+
+			if success then
+				print("Function '" .. FuncName .. "' executed successfully.")
+				SubReq:resolve()
+				return "Success" and subReq
+			else
+				SubReq:reject("Error executing "..FuncName..": "..errorOrResult)
+				warn("Error executing function '" .. FuncName .. "': " .. errorOrResult)
+				return "Error executing function '" .. FuncName .. "': " .. errorOrResult and subReq
+			end
+		else
+			SubReq:reject("Invalid data format for function "..FuncName..", Expected table.")
+			warn("Invalid data format for function '" .. FuncName .. "'. Expected table.")
+			return "Invalid data format for function '" .. FuncName .. "'. Expected table." and subReq
+		end
+	else
+		SubReq:reject("Function not found: "..FuncName)
+		warn("Function not found: '" .. FuncName .. "'")
+		return "Function not found: '" .. FuncName .. "'" and subReq
+	end
+end
+
+function module:DeleteCusFunc(FuncName: string)
+	local subReq = createSubReq()
+	
+	if CustomFuncs[FuncName] then
+		CustomFuncs[FuncName] = nil
+		SubReq:resolve()
+	else
+		warn("Custom function:", FuncName, "does not exist!")
+		SubReq:reject("Custom function doesn't exist!")
+		return "Function doesn't exist!"
+	end
+	
+	return subReq
+end
+
+function  module:AlterProfileDataByKey(Key, Table: {})
+	local subReq = createSubReq()
+	local function recursiveUpdate(target, updates)
+		for key, value in pairs(updates) do
+			if type(value) == "table" and type(target[key]) == "table" then
+				recursiveUpdate(target[key], value)
+			else
+				target[key] = value
+			end
+		end
+	end
+
+	if SessionData[Key] then
+		recursiveUpdate(SessionData[Key], Table)
+		subReq:resolve()
+		print("Finished!")
+	else
+		warn("Failed | Unable to alter data. Player data not found for UserID:", Key)
+		SubReq:reject("Unable to alter data: Player not found for UserId: "..Key)
+	end
+
+	return SubReq
+end
+
+function module:AlterProfileData(Player, Table: {})
+	local subReq = createSubReq()
+	local function recursiveUpdate(target, updates)
+		for key, value in pairs(updates) do
+			if type(value) == "table" and type(target[key]) == "table" then
+				recursiveUpdate(target[key], value)
+			else
+				target[key] = value
+			end
+		end
+	end
+
+	if SessionData[Player.UserId] then
+		recursiveUpdate(SessionData[Player.UserId], Table)
+
+		local leaderstats = Player:FindFirstChild("leaderstats")
+		if leaderstats then
+			for key, value in pairs(Table) do
+				local stat = leaderstats:FindFirstChild(key)
+				if stat then
+					if type(value) == "number" then
+						stat.Value = value
+					elseif type(value) == "string" and tonumber(value) then
+						stat.Value = tonumber(value)
+					elseif type(value) == "boolean" then
+						stat.Value = value
+					end
+				end
+			end
+		end
+
+		local CurrentCash = module:ReturnData(Player, {"Cash"})
+		local Cash = CurrentCash["Cash"]
+		
+		game.ReplicatedStorage.Remotes.UpdateCash:FireClient(Player, Cash)
+
+		subReq:resolve()
+		print("Finished!")
+	else
+		warn("Failed | Unable to alter data. Player data not found for UserID:", Player.UserId)
+		SubReq:reject("Unable to alter data: Player not found for UserId: "..Player.UserId)
+	end
+	
+	return SubReq
+end
+
+function module:CreateProfileData(ID, Data)
+	local subReq = createSubReq()
+
+	if not SessionData[ID] then
+		warn("is not in game!")
+		subReq:reject("Player not in game!")
+	end
+
+	if not SessionData[ID]["PlayerData"] then
+		SessionData[ID]["PlayerData"] = {}
+	end
+
+	if not SessionData[ID]["PlayerData"]["Cars"] then
+		SessionData[ID]["PlayerData"]["Cars"] = {}
+	end
+
+	for key, value in pairs(Data) do
+		if key == "Cars" then
+			if not SessionData[ID]["PlayerData"]["Cars"] then
+				SessionData[ID]["PlayerData"]["Cars"] = {}
+			end
+
+			for carName, carValue in pairs(value) do
+				SessionData[ID]["PlayerData"]["Cars"][carName] = carValue
+			end
+		else
+			SessionData[ID]["PlayerData"][key] = value
+		end
+	end
+
+	print(string.format("Player %s's profile data updated:", ID))
+	subReq:resolve()
+	for key, value in pairs(Data) do
+		print(string.format("%s: %s", key, tostring(value)))
+	end
+
+	return subReq
+end
+
+
+function module:SetLock(Player: Player, Value: BoolValue)
+	local subReq = createSubReq()
+	if SessionData[Player.UserId]["Profile_Locked"] then
+		SessionData[Player.UserId]["Profile_Locked"] = Value
+	else
+		module:CreateProfileData(Player, {["Profile_Locked"] = Value})
+	end
+	
+	subReq:resolve()
+	return subReq
+end
+
+function module:ReturnCusFunc(FuncName: string)
+	local subReq = createSubReq()
+	local customFunc = CustomFuncs[FuncName]
+
+	if type(customFunc) == "function" then
+		print("Custom function '" .. FuncName .. "' found.")
+		print("Function details: " .. tostring(customFunc))
+		subReq:resolve()
+		return customFunc and subReq
+	else
+		warn("Function not found: " .. FuncName)
+		subReq:resolve()
+		return nil and subReq
+	end
+end
+
+function module:ConvertVct3ToTable(Vect3: Vector3)
+	return {
+		X = Vect3.X,
+		Y = Vect3.Y,
+		Z = Vect3.Z
+	}
+end
+
+function module:ConvertTableToVct3(Table)
+	return Vector3.new(Table.X, Table.Y, Table.Z)
+end
+
+function module:ConvertClr3ToTable(Color3: Color3)
+	return {
+		R = Color3.R,
+		G = Color3.G,
+		B = Color3.B
+	}
+end
+
+function module:ConvertTableToClr3(Table)
+	return Color3.fromRGB(Table.R, Table.B, Table.G)
+end
+
+return module
